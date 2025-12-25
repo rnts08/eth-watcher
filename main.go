@@ -62,106 +62,110 @@ type ContractState struct {
 	Traded           bool
 }
 
-var (
-	cfg     Config
-	tracked = make(map[string]*ContractState)
-	lock    sync.RWMutex
+type WatcherStats struct {
+	NewContracts int
+	Mints        int
+	Liquidity    int
+	Trades       int
+}
 
+type Watcher struct {
+	cfg         Config
+	tracked     map[string]*ContractState
+	lock        sync.RWMutex
 	transferSig common.Hash
 	dexPairs    []common.Hash
 	dexSwaps    []common.Hash
-
-	startTime time.Time
-	stats     = struct {
-		NewContracts int
-		Mints        int
-		Liquidity    int
-		Trades       int
-	}{}
-)
+	startTime   time.Time
+	stats       WatcherStats
+}
 
 func main() {
-	startTime = time.Now()
+	w := &Watcher{
+		tracked:   make(map[string]*ContractState),
+		startTime: time.Now(),
+	}
 
 	configPath := flag.String("config", "config.json", "Path to configuration JSON")
 	flag.Parse()
 
-	loadConfig(*configPath)
-	setupLogging()
+	w.loadConfig(*configPath)
+	w.setupLogging()
 
 	log.Println("eth-watch starting…")
 
-	client, err := ethclient.Dial(cfg.RPC)
+	client, err := ethclient.Dial(w.cfg.RPC)
 	if err != nil {
 		log.Fatalf("RPC connection failed: %v", err)
 	}
 
-	outFile, err := os.OpenFile(cfg.Output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	outFile, err := os.OpenFile(w.cfg.Output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open output file: %v", err)
 	}
 	defer outFile.Close()
 
-	transferSig = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+	// Keccak-256 hash of the standard ERC-20 and ERC-721 Transfer event signature.
+	w.transferSig = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
-	for _, d := range cfg.Dexes {
-		dexPairs = append(dexPairs, common.HexToHash(d.PairCreatedTopic))
-		dexSwaps = append(dexSwaps, common.HexToHash(d.SwapTopic))
+	for _, d := range w.cfg.Dexes {
+		w.dexPairs = append(w.dexPairs, common.HexToHash(d.PairCreatedTopic))
+		w.dexSwaps = append(w.dexSwaps, common.HexToHash(d.SwapTopic))
 	}
 
-	loadWatchedContracts()
+	w.loadWatchedContracts()
 
-	go subscribeDeployments(client, outFile)
-	if cfg.Events.Transfers {
-		go subscribeTransfers(client, outFile)
+	go w.subscribeDeployments(client, outFile)
+	if w.cfg.Events.Transfers {
+		go w.subscribeTransfers(client, outFile)
 	}
-	if cfg.Events.Liquidity || cfg.Events.Trades {
-		subscribeLiquidityAndTrades(client, outFile)
+	if w.cfg.Events.Liquidity || w.cfg.Events.Trades {
+		w.subscribeLiquidityAndTrades(client, outFile)
 	}
 }
 
-func loadConfig(path string) {
+func (w *Watcher) loadConfig(path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		log.Fatalf("config open error: %v", err)
 	}
 	defer f.Close()
 
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+	if err := json.NewDecoder(f).Decode(&w.cfg); err != nil {
 		log.Fatalf("config decode error: %v", err)
 	}
 
-	if cfg.RPC == "" {
+	if w.cfg.RPC == "" {
 		log.Fatal("rpc required in config")
 	}
-	if cfg.Output == "" {
-		cfg.Output = "eth-watch-events.jsonl"
+	if w.cfg.Output == "" {
+		w.cfg.Output = "eth-watch-events.jsonl"
 	}
-	if cfg.Log == "" {
-		cfg.Log = "eth-watch.log"
+	if w.cfg.Log == "" {
+		w.cfg.Log = "eth-watch.log"
 	}
 }
 
-func setupLogging() {
-	logFile, err := os.OpenFile(cfg.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+func (w *Watcher) setupLogging() {
+	logFile, err := os.OpenFile(w.cfg.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("log file open error: %v", err)
 	}
 	log.SetOutput(logFile)
 }
 
-func loadWatchedContracts() {
-	for _, c := range cfg.Contracts {
+func (w *Watcher) loadWatchedContracts() {
+	for _, c := range w.cfg.Contracts {
 		addr := strings.ToLower(c.Address)
-		tracked[addr] = &ContractState{
+		w.tracked[addr] = &ContractState{
 			Deployer:  "unknown",
 			TokenType: c.Type,
 		}
 	}
-	log.Printf("Loaded %d watched contracts\n", len(tracked))
+	log.Printf("Loaded %d watched contracts\n", len(w.tracked))
 }
 
-func subscribeDeployments(client *ethclient.Client, out *os.File) {
+func (w *Watcher) subscribeDeployments(client *ethclient.Client, out *os.File) {
 	headers := make(chan *types.Header)
 	sub, err := client.SubscribeNewHead(context.Background(), headers)
 	if err != nil {
@@ -207,13 +211,13 @@ func subscribeDeployments(client *ethclient.Client, out *os.File) {
 
 				addr := strings.ToLower(receipt.ContractAddress.Hex())
 
-				lock.Lock()
-				tracked[addr] = &ContractState{
+				w.lock.Lock()
+				w.tracked[addr] = &ContractState{
 					Deployer:  from.Hex(),
 					TokenType: tokenType,
 				}
-				stats.NewContracts++
-				lock.Unlock()
+				w.stats.NewContracts++
+				w.lock.Unlock()
 
 				log.Printf("New contract %s type=%s deployer=%s", addr, tokenType, from.Hex())
 
@@ -227,15 +231,15 @@ func subscribeDeployments(client *ethclient.Client, out *os.File) {
 					TxHash:    tx.Hash().Hex(),
 				})
 
-				writeStats()
+				w.writeStats()
 			}
 		}
 	}
 }
 
-func subscribeTransfers(client *ethclient.Client, out *os.File) {
+func (w *Watcher) subscribeTransfers(client *ethclient.Client, out *os.File) {
 	query := ethereum.FilterQuery{
-		Topics: [][]common.Hash{{transferSig}},
+		Topics: [][]common.Hash{{w.transferSig}},
 	}
 
 	logsChan := make(chan types.Log)
@@ -250,14 +254,14 @@ func subscribeTransfers(client *ethclient.Client, out *os.File) {
 			log.Fatalf("Transfer subscription error: %v", err)
 
 		case vLog := <-logsChan:
-			handleTransfer(vLog, out)
+			w.handleTransfer(vLog, out)
 		}
 	}
 }
 
-func subscribeLiquidityAndTrades(client *ethclient.Client, out *os.File) {
+func (w *Watcher) subscribeLiquidityAndTrades(client *ethclient.Client, out *os.File) {
 	query := ethereum.FilterQuery{
-		Topics: [][]common.Hash{append(dexPairs, dexSwaps...)},
+		Topics: [][]common.Hash{append(w.dexPairs, w.dexSwaps...)},
 	}
 
 	logsChan := make(chan types.Log)
@@ -272,12 +276,12 @@ func subscribeLiquidityAndTrades(client *ethclient.Client, out *os.File) {
 			log.Fatalf("Liquidity subscription error: %v", err)
 
 		case vLog := <-logsChan:
-			handleLiquidityOrTrade(vLog, out)
+			w.handleLiquidityOrTrade(vLog, out)
 		}
 	}
 }
 
-func handleTransfer(vLog types.Log, out *os.File) {
+func (w *Watcher) handleTransfer(vLog types.Log, out *os.File) {
 	if len(vLog.Topics) < 3 {
 		return
 	}
@@ -289,15 +293,15 @@ func handleTransfer(vLog types.Log, out *os.File) {
 
 	contract := strings.ToLower(vLog.Address.Hex())
 
-	lock.Lock()
-	state, ok := tracked[contract]
+	w.lock.Lock()
+	state, ok := w.tracked[contract]
 	if !ok {
-		lock.Unlock()
+		w.lock.Unlock()
 		return
 	}
 	state.Mints++
-	stats.Mints++
-	lock.Unlock()
+	w.stats.Mints++
+	w.lock.Unlock()
 
 	log.Printf("Mint detected contract=%s totalMints=%d", contract, state.Mints)
 
@@ -329,17 +333,17 @@ func handleTransfer(vLog types.Log, out *os.File) {
 		TxHash:       vLog.TxHash.Hex(),
 	})
 
-	writeStats()
+	w.writeStats()
 }
 
-func handleLiquidityOrTrade(vLog types.Log, out *os.File) {
-	lock.Lock()
-	defer lock.Unlock()
+func (w *Watcher) handleLiquidityOrTrade(vLog types.Log, out *os.File) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
 
-	for addr, state := range tracked {
-		if containsHash(dexPairs, vLog.Topics[0]) && !state.LiquidityCreated {
+	for addr, state := range w.tracked {
+		if containsHash(w.dexPairs, vLog.Topics[0]) && !state.LiquidityCreated {
 			state.LiquidityCreated = true
-			stats.Liquidity++
+			w.stats.Liquidity++
 
 			log.Printf("Liquidity detected for %s", addr)
 
@@ -353,12 +357,12 @@ func handleLiquidityOrTrade(vLog types.Log, out *os.File) {
 				TxHash:    vLog.TxHash.Hex(),
 			})
 
-			writeStats()
+			w.writeStats()
 		}
 
-		if containsHash(dexSwaps, vLog.Topics[0]) && !state.Traded {
+		if containsHash(w.dexSwaps, vLog.Topics[0]) && !state.Traded {
 			state.Traded = true
-			stats.Trades++
+			w.stats.Trades++
 
 			log.Printf("Trade detected for %s", addr)
 
@@ -372,7 +376,7 @@ func handleLiquidityOrTrade(vLog types.Log, out *os.File) {
 				TxHash:    vLog.TxHash.Hex(),
 			})
 
-			writeStats()
+			w.writeStats()
 		}
 	}
 }
@@ -412,15 +416,14 @@ func writeEvent(out *os.File, f Finding) {
 	_ = w.Flush()
 }
 
-func writeStats() {
-	uptime := time.Since(startTime).Round(time.Second)
+func (w *Watcher) writeStats() {
+	uptime := time.Since(w.startTime).Round(time.Second)
 	log.Printf(
 		"stats uptime=%s contracts=%d mints=%d liquidity=%d trades=%d",
 		uptime,
-		stats.NewContracts,
-		stats.Mints,
-		stats.Liquidity,
-		stats.Trades,
+		w.stats.NewContracts,
+		w.stats.Mints,
+		w.stats.Liquidity,
+		w.stats.Trades,
 	)
 }
-
