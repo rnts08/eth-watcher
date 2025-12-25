@@ -1,0 +1,143 @@
+{
+  "rpc": "wss://ethereum-rpc.publicnode.com",
+  "apiKey": "",
+  "output": "eth-watch-events.jsonl",
+  "log": "eth-watch.log",
+
+  "events": {
+    "transfers": true,
+    "liquidity": true,
+    "trades": true
+  },
+
+  "dexes": [
+    {
+      "name": "UniswapV2",
+      "pairCreatedTopic": "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9",
+      "swapTopic": "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
+      "description": "Uniswap V2 AMM DEX event topics for pair creation and swaps"
+    }
+  ],
+
+  "contracts": [
+    {
+      "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      "name": "WETH",
+      "type": "erc20",
+      "risk_weight": 1.0,
+      "description": "Wrapped ETH – core asset used across DeFi and liquidity pools"
+    },
+    {
+      "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "name": "USDC",
+      "type": "erc20",
+      "risk_weight": 1.2,
+      "description": "Circle USD Coin – major fiat-backed stablecoin used in DeFi"
+    },
+    {
+      "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "name": "USDT",
+      "type": "erc20",
+      "risk_weight": 1.3,
+      "description": "Tether USD – largest stablecoin by market cap, significant market flow indicator"
+    },
+    {
+      "address": "0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B",
+      "name": "Compound Comptroller",
+      "type": "protocol",
+      "risk_weight": 1.5,
+      "description": "Compound v2 Comptroller – central governance and risk module for lending protocol"
+    },
+    {
+      "address": "0x7Be7952d43cc2A5ddDaC38bC6E889c57D665DF56",
+      "name": "Aave Lending Pool v2",
+      "type": "protocol",
+      "risk_weight": 1.6,
+      "description": "Aave v2 lending pool – collateralized lending and borrowing hub"
+    },
+    {
+      "address": "0xbEb5Fc579115071764c7423A4F12eDde41f106Ed",
+      "name": "Curve 3Pool",
+      "type": "protocol",
+      "risk_weight": 1.7,
+      "description": "Curve Finance 3pool – central stablecoin liquidity hub"
+    },
+    {
+      "address": "0x00000000000000ADc04C56BF30aC9d3c0aAF14DC",
+      "name": "OpenSea Seaport",
+      "type": "marketplace",
+      "risk_weight": 1.4,
+      "description": "OpenSea Seaport NFT marketplace contract"
+    },
+    {
+      "address": "0x000000000000Ad05Ccc4F10045630fb830B95127",
+      "name": "Blur Marketplace",
+      "type": "marketplace",
+      "risk_weight": 1.6,
+      "description": "Blur NFT marketplace core contract"
+    },
+    {
+      "address": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
+      "name": "BAYC",
+      "type": "erc721",
+      "risk_weight": 1.8,
+      "description": "Bored Ape Yacht Club NFT collection contract"
+    },
+    {
+      "address": "0x4c6f947Ae67F572afa4ae0730947DE7C874F95Ef",
+      "name": "Arbitrum Bridge Inbox",
+      "type": "bridge",
+      "risk_weight": 1.9,
+      "description": "Arbitrum L2 canonical bridge entrypoint contract"
+    },
+    {
+      "address": "0x4200000000000000000000000000000000000006",
+      "name": "Optimism Canonical Bridge",
+      "type": "bridge",
+      "risk_weight": 1.9,
+      "description": "Optimism L2 canonical bridge contract"
+    },
+    {
+      "address": "0x401F6c983eA34274ec46f84D70b31C151321188b",
+      "name": "Polygon PoS Bridge",
+      "type": "bridge",
+      "risk_weight": 1.7,
+      "description": "Polygon Proof-of-Stake bridge contract"
+    },
+    {
+      "address": "0x6982508145454Ce325dDbE47a25d4ec3d2311933",
+      "name": "PEPE",
+      "type": "erc20",
+      "risk_weight": 2.2,
+      "description": "High-volatility meme token – useful for stress testing analytics"
+    },
+    {
+      "address": "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE",
+      "name": "Shiba Inu",
+      "type": "erc20",
+      "risk_weight": 2.0,
+      "description": "Major meme token with large trading volume and retail exposure"
+    },
+    {
+      "address": "0x4E3bbb5B6ef0c27B748A760199bDB5eB23C4aCFe",
+      "name": "Uniswap Governor Bravo",
+      "type": "governance",
+      "risk_weight": 1.5,
+      "description": "Uniswap governance contract controlling protocol upgrades"
+    },
+    {
+      "address": "0xEC568fffba86c094cf06b22134B23074DFE2252c",
+      "name": "Aave Governance v2",
+      "type": "governance",
+      "risk_weight": 1.6,
+      "description": "Aave DAO governance contract"
+    }
+  ],
+
+  "watcher": {
+    "daemon": "./eth-watch -config config.json",
+    "interval": 5,
+    "log": "eth-watch-monitor.log"
+  }
+}
+
