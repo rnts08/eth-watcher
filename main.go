@@ -79,24 +79,27 @@ type WatcherMetrics struct {
 	MintsDetected       prometheus.Counter
 	LiquidityEvents     prometheus.Counter
 	TradesDetected      prometheus.Counter
+	RPCStalled          prometheus.Gauge
 }
 
 type Watcher struct {
-	cfg         Config
-	tracked     map[string]*ContractState
-	lock        sync.RWMutex
-	transferSig common.Hash
-	dexPairs    []common.Hash
-	dexSwaps    []common.Hash
-	startTime   time.Time
-	stats       WatcherStats
-	promMetrics WatcherMetrics
+	cfg            Config
+	tracked        map[string]*ContractState
+	lock           sync.RWMutex
+	transferSig    common.Hash
+	dexPairs       []common.Hash
+	dexSwaps       []common.Hash
+	startTime      time.Time
+	stats          WatcherStats
+	promMetrics    WatcherMetrics
+	lastHeaderTime time.Time
 }
 
 func main() {
 	w := &Watcher{
-		tracked:   make(map[string]*ContractState),
-		startTime: time.Now(),
+		tracked:        make(map[string]*ContractState),
+		startTime:      time.Now(),
+		lastHeaderTime: time.Now(),
 	}
 
 	configPath := flag.String("config", "config.json", "Path to configuration JSON")
@@ -123,8 +126,12 @@ func main() {
 			Name: "eth_watcher_trades_detected_total",
 			Help: "Total number of trades detected",
 		}),
+		RPCStalled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "eth_watcher_rpc_stalled",
+			Help: "Indicates if the RPC connection is stalled (1=stalled, 0=healthy)",
+		}),
 	}
-	prometheus.MustRegister(w.promMetrics.ContractsDiscovered, w.promMetrics.MintsDetected, w.promMetrics.LiquidityEvents, w.promMetrics.TradesDetected)
+	prometheus.MustRegister(w.promMetrics.ContractsDiscovered, w.promMetrics.MintsDetected, w.promMetrics.LiquidityEvents, w.promMetrics.TradesDetected, w.promMetrics.RPCStalled)
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
@@ -135,11 +142,6 @@ func main() {
 	}()
 
 	log.Println("eth-watch starting…")
-
-	client, err := ethclient.Dial(w.cfg.RPC)
-	if err != nil {
-		log.Fatalf("RPC connection failed: %v", err)
-	}
 
 	outFile, err := os.OpenFile(w.cfg.Output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
@@ -157,30 +159,56 @@ func main() {
 
 	w.loadWatchedContracts()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Shutdown signal received, stopping...")
+		rootCancel()
+	}()
 
-	var wg sync.WaitGroup
+	for {
+		if rootCtx.Err() != nil {
+			break
+		}
 
-	wg.Add(1)
-	go w.subscribeDeployments(ctx, client, outFile, &wg)
+		client, err := ethclient.Dial(w.cfg.RPC)
+		if err != nil {
+			log.Printf("RPC connection failed: %v. Retrying in 5s...", err)
+			select {
+			case <-rootCtx.Done():
+				continue
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
 
-	if w.cfg.Events.Transfers {
+		sessCtx, sessCancel := context.WithCancel(rootCtx)
+		var wg sync.WaitGroup
+
 		wg.Add(1)
-		go w.subscribeTransfers(ctx, client, outFile, &wg)
-	}
-	if w.cfg.Events.Liquidity || w.cfg.Events.Trades {
-		wg.Add(1)
-		go w.subscribeLiquidityAndTrades(ctx, client, outFile, &wg)
-	}
+		go w.startWatchdog(sessCtx, &wg, sessCancel)
 
-	<-sigChan
-	log.Println("Shutdown signal received, stopping...")
-	cancel()
-	wg.Wait()
+		wg.Add(1)
+		go w.subscribeDeployments(sessCtx, client, outFile, &wg, sessCancel)
+
+		if w.cfg.Events.Transfers {
+			wg.Add(1)
+			go w.subscribeTransfers(sessCtx, client, outFile, &wg, sessCancel)
+		}
+		if w.cfg.Events.Liquidity || w.cfg.Events.Trades {
+			wg.Add(1)
+			go w.subscribeLiquidityAndTrades(sessCtx, client, outFile, &wg, sessCancel)
+		}
+
+		<-sessCtx.Done()
+		client.Close()
+		wg.Wait()
+		log.Println("Session ended, reconnecting...")
+	}
 	log.Println("Graceful shutdown complete")
 }
 
@@ -225,13 +253,42 @@ func (w *Watcher) loadWatchedContracts() {
 	log.Printf("Loaded %d watched contracts\n", len(w.tracked))
 }
 
-func (w *Watcher) subscribeDeployments(ctx context.Context, client *ethclient.Client, out *os.File, wg *sync.WaitGroup) {
+func (w *Watcher) startWatchdog(ctx context.Context, wg *sync.WaitGroup, cancel context.CancelFunc) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.lock.RLock()
+			last := w.lastHeaderTime
+			w.lock.RUnlock()
+
+			if time.Since(last) > 60*time.Second {
+				log.Printf("ALERT: RPC connection stalled! No new blocks seen for %v. Reconnecting...", time.Since(last).Round(time.Second))
+				w.promMetrics.RPCStalled.Set(1)
+				cancel()
+				return
+			} else {
+				w.promMetrics.RPCStalled.Set(0)
+			}
+		}
+	}
+}
+
+func (w *Watcher) subscribeDeployments(ctx context.Context, client *ethclient.Client, out *os.File, wg *sync.WaitGroup, cancel context.CancelFunc) {
 	defer wg.Done()
 
 	headers := make(chan *types.Header)
 	sub, err := client.SubscribeNewHead(ctx, headers)
 	if err != nil {
-		log.Fatalf("Header subscription failed: %v", err)
+		log.Printf("Header subscription failed: %v", err)
+		cancel()
+		return
 	}
 
 	for {
@@ -239,9 +296,15 @@ func (w *Watcher) subscribeDeployments(ctx context.Context, client *ethclient.Cl
 		case <-ctx.Done():
 			return
 		case err := <-sub.Err():
-			log.Fatalf("Header subscription error: %v", err)
+			log.Printf("Header subscription error: %v", err)
+			cancel()
+			return
 
 		case header := <-headers:
+			w.lock.Lock()
+			w.lastHeaderTime = time.Now()
+			w.lock.Unlock()
+
 			block, err := client.BlockByHash(context.Background(), header.Hash())
 			if err != nil {
 				log.Printf("Block lookup error: %v", err)
@@ -302,7 +365,7 @@ func (w *Watcher) subscribeDeployments(ctx context.Context, client *ethclient.Cl
 	}
 }
 
-func (w *Watcher) subscribeTransfers(ctx context.Context, client *ethclient.Client, out *os.File, wg *sync.WaitGroup) {
+func (w *Watcher) subscribeTransfers(ctx context.Context, client *ethclient.Client, out *os.File, wg *sync.WaitGroup, cancel context.CancelFunc) {
 	defer wg.Done()
 
 	query := ethereum.FilterQuery{
@@ -312,7 +375,9 @@ func (w *Watcher) subscribeTransfers(ctx context.Context, client *ethclient.Clie
 	logsChan := make(chan types.Log)
 	sub, err := client.SubscribeFilterLogs(ctx, query, logsChan)
 	if err != nil {
-		log.Fatalf("Transfer subscription failed: %v", err)
+		log.Printf("Transfer subscription failed: %v", err)
+		cancel()
+		return
 	}
 
 	for {
@@ -320,7 +385,9 @@ func (w *Watcher) subscribeTransfers(ctx context.Context, client *ethclient.Clie
 		case <-ctx.Done():
 			return
 		case err := <-sub.Err():
-			log.Fatalf("Transfer subscription error: %v", err)
+			log.Printf("Transfer subscription error: %v", err)
+			cancel()
+			return
 
 		case vLog := <-logsChan:
 			w.handleTransfer(vLog, out)
@@ -328,7 +395,7 @@ func (w *Watcher) subscribeTransfers(ctx context.Context, client *ethclient.Clie
 	}
 }
 
-func (w *Watcher) subscribeLiquidityAndTrades(ctx context.Context, client *ethclient.Client, out *os.File, wg *sync.WaitGroup) {
+func (w *Watcher) subscribeLiquidityAndTrades(ctx context.Context, client *ethclient.Client, out *os.File, wg *sync.WaitGroup, cancel context.CancelFunc) {
 	defer wg.Done()
 
 	query := ethereum.FilterQuery{
@@ -338,7 +405,9 @@ func (w *Watcher) subscribeLiquidityAndTrades(ctx context.Context, client *ethcl
 	logsChan := make(chan types.Log)
 	sub, err := client.SubscribeFilterLogs(ctx, query, logsChan)
 	if err != nil {
-		log.Fatalf("Liquidity subscription failed: %v", err)
+		log.Printf("Liquidity subscription failed: %v", err)
+		cancel()
+		return
 	}
 
 	for {
@@ -346,7 +415,9 @@ func (w *Watcher) subscribeLiquidityAndTrades(ctx context.Context, client *ethcl
 		case <-ctx.Done():
 			return
 		case err := <-sub.Err():
-			log.Fatalf("Liquidity subscription error: %v", err)
+			log.Printf("Liquidity subscription error: %v", err)
+			cancel()
+			return
 
 		case vLog := <-logsChan:
 			w.handleLiquidityOrTrade(vLog, out)
