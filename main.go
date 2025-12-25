@@ -483,74 +483,82 @@ func (w *Watcher) handleTransfer(vLog types.Log, out *os.File) {
 
 func (w *Watcher) handleLiquidityOrTrade(vLog types.Log, out *os.File) {
 	if containsHash(w.dexPairs, vLog.Topics[0]) {
-		if len(vLog.Topics) < 3 {
-			return
-		}
-
-		// Extract token addresses from topics (Topic 1 and Topic 2)
-		token0 := common.HexToAddress(vLog.Topics[1].Hex())
-		token1 := common.HexToAddress(vLog.Topics[2].Hex())
-		tokens := []string{strings.ToLower(token0.Hex()), strings.ToLower(token1.Hex())}
-
-		w.lock.Lock()
-		defer w.lock.Unlock()
-
-		for _, addr := range tokens {
-			state, ok := w.tracked[addr]
-			if !ok || state.LiquidityCreated {
-				continue
-			}
-
-			state.LiquidityCreated = true
-			w.stats.Liquidity++
-			w.promMetrics.LiquidityEvents.Inc()
-
-			log.Printf("Liquidity detected for %s", addr)
-
-			writeEvent(out, Finding{
-				Contract:  addr,
-				Deployer:  state.Deployer,
-				Block:     uint64(vLog.BlockNumber),
-				TokenType: state.TokenType,
-				RiskScore: 25,
-				Flags:     []string{"LiquidityCreated"},
-				TxHash:    vLog.TxHash.Hex(),
-			})
-
-			w.writeStats()
-		}
+		w.handleLiquidityEvent(vLog, out)
 		return
 	}
 
 	if containsHash(w.dexSwaps, vLog.Topics[0]) {
-		addr := strings.ToLower(vLog.Address.Hex())
+		w.handleTradeEvent(vLog, out)
+	}
+}
 
-		w.lock.Lock()
-		defer w.lock.Unlock()
+func (w *Watcher) handleLiquidityEvent(vLog types.Log, out *os.File) {
+	if len(vLog.Topics) < 3 {
+		return
+	}
 
+	// Extract token addresses from topics (Topic 1 and Topic 2)
+	token0 := common.HexToAddress(vLog.Topics[1].Hex())
+	token1 := common.HexToAddress(vLog.Topics[2].Hex())
+	tokens := []string{strings.ToLower(token0.Hex()), strings.ToLower(token1.Hex())}
+
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	for _, addr := range tokens {
 		state, ok := w.tracked[addr]
-		if !ok || state.Traded {
-			return
+		if !ok || state.LiquidityCreated {
+			continue
 		}
 
-		state.Traded = true
-		w.stats.Trades++
-		w.promMetrics.TradesDetected.Inc()
+		state.LiquidityCreated = true
+		w.stats.Liquidity++
+		w.promMetrics.LiquidityEvents.Inc()
 
-		log.Printf("Trade detected for %s", addr)
+		log.Printf("Liquidity detected for %s", addr)
 
 		writeEvent(out, Finding{
 			Contract:  addr,
 			Deployer:  state.Deployer,
 			Block:     uint64(vLog.BlockNumber),
 			TokenType: state.TokenType,
-			RiskScore: 20,
-			Flags:     []string{"TradingDetected"},
+			RiskScore: 25,
+			Flags:     []string{"LiquidityCreated"},
 			TxHash:    vLog.TxHash.Hex(),
 		})
 
 		w.writeStats()
 	}
+}
+
+func (w *Watcher) handleTradeEvent(vLog types.Log, out *os.File) {
+	addr := strings.ToLower(vLog.Address.Hex())
+
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	state, ok := w.tracked[addr]
+	if !ok || state.Traded {
+		return
+	}
+
+	state.Traded = true
+	w.stats.Trades++
+	w.promMetrics.TradesDetected.Inc()
+
+	log.Printf("Trade detected for %s", addr)
+
+	writeEvent(out, Finding{
+		Contract:  addr,
+		Deployer:  state.Deployer,
+		Block:     uint64(vLog.BlockNumber),
+		TokenType: state.TokenType,
+		RiskScore: 20,
+		Flags:     []string{"TradingDetected"},
+		TxHash:    vLog.TxHash.Hex(),
+	})
+
+	w.writeStats()
 }
 
 func detectTokenType(code []byte) string {
