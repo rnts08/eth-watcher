@@ -23,6 +23,7 @@ ETH Watcher is a real-time Ethereum event monitoring tool written in Go. It conn
 The application is configured via a JSON file (default: `config.json`).
 
 Key configuration sections:
+
 - `rpc`: WebSocket URL for the Ethereum node.
 - `events`: Toggles for specific event types (`transfers`, `liquidity`, `trades`).
 - `dexes`: List of DEX event topics to watch.
@@ -68,18 +69,24 @@ go test -race -v .
 ## Output
 
 ### Events
+
 Detected events are written to the configured output file (e.g., `eth-watch-events.jsonl`) in JSON Lines format.
 
 Example:
+
 ```json
 {"contract":"0x...","deployer":"0x...","block":123456,"tokenType":"ERC20","mintDetected":true,"riskScore":55,"flags":["MintDetected"],"txHash":"0x..."}
 ```
 
 ### Metrics
+
 Prometheus metrics are exposed at `http://localhost:2112/metrics` (or the configured address).
 
 
 ### Tips and appreciations
-ETH/ERC20: 0x9b4FfDADD87022C8B7266e28ad851496115ffB48
-SOL: 68L4XzSbRUaNE4UnxEd8DweSWEoiMQi6uygzERZLbXDw
-BTC: bc1qkmzc6d49fl0edyeynezwlrfqv486nmk6p5pmta
+
+***ETH/ERC20:*** 0x9b4FfDADD87022C8B7266e28ad851496115ffB48
+
+***SOL:*** 68L4XzSbRUaNE4UnxEd8DweSWEoiMQi6uygzERZLbXDw
+
+***BTC:*** bc1qkmzc6d49fl0edyeynezwlrfqv486nmk6p5pmta
