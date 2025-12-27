@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"math/big"
 	"net/http"
@@ -28,12 +30,17 @@ const (
 	rpcTripDuration = 5 * time.Minute
 )
 
+type RPCConfig struct {
+	URL    string `json:"url"`
+	APIKey string `json:"apiKey,omitempty"`
+}
+
 type Config struct {
-	RPC            []string `json:"rpc"`
-	APIKey         string   `json:"apiKey,omitempty"`
-	Output         string   `json:"output"`
-	Log            string   `json:"log"`
-	WhaleThreshold string   `json:"whale_threshold"`
+	RPC            []RPCConfig `json:"rpc"`
+	Output         string      `json:"output"`
+	Log            string      `json:"log"`
+	WhaleThreshold string      `json:"whale_threshold"`
+	Concurrency    int         `json:"concurrency,omitempty"`
 
 	Events struct {
 		Transfers  bool `json:"transfers"`
@@ -104,23 +111,31 @@ type WatcherMetrics struct {
 	RPCLatency             prometheus.Histogram
 	RPCCircuitBreakerTrips *prometheus.CounterVec
 	CodeAnalysisFlags      *prometheus.CounterVec
+	ChainIDFetchFailures   *prometheus.CounterVec
+	CodeAnalysisDuration   prometheus.Histogram
 }
 
 type Watcher struct {
-	cfg            Config
-	tracked        map[string]*ContractState
-	lock           sync.RWMutex
-	transferSig    common.Hash
-	dexPairs       []common.Hash
-	dexSwaps       []common.Hash
-	flashLoanSig   common.Hash
-	approvalSig    common.Hash
-	startTime      time.Time
-	stats          WatcherStats
-	promMetrics    WatcherMetrics
-	lastHeaderTime time.Time
-	rpcStates      []*RPCState
-	whaleThreshold *big.Int
+	cfg               Config
+	tracked           map[string]*ContractState
+	lock              sync.RWMutex
+	transferSig       common.Hash
+	dexPairs          []common.Hash
+	dexSwaps          []common.Hash
+	flashLoanSig      common.Hash
+	approvalSig       common.Hash
+	startTime         time.Time
+	stats             WatcherStats
+	promMetrics       WatcherMetrics
+	lastHeaderTime    time.Time
+	rpcStates         []*RPCState
+	whaleThreshold    *big.Int
+	chainID           *big.Int
+	fileLock          sync.Mutex
+	configLock        sync.RWMutex
+	sessCancel        context.CancelFunc
+	configPath        string
+	lastConfigModTime time.Time
 }
 
 func main() {
@@ -132,14 +147,39 @@ func main() {
 
 	configPath := flag.String("config", "config.json", "Path to configuration JSON")
 	metricsAddr := flag.String("metrics", ":2112", "Address to serve Prometheus metrics")
+	concurrencyOverride := flag.Int("concurrency", 0, "Override concurrency level (default: use config)")
+	testConfig := flag.Bool("t", false, "Test configuration and exit")
 	flag.Parse()
 
+	w.configPath = *configPath
+	if info, err := os.Stat(w.configPath); err == nil {
+		w.lastConfigModTime = info.ModTime()
+	}
+
+	if *testConfig {
+		cfg, err := loadConfiguration(w.configPath)
+		if err != nil {
+			fmt.Printf("Configuration error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := validateConfig(cfg); err != nil {
+			fmt.Printf("Configuration validation failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Configuration OK")
+		os.Exit(0)
+	}
+
 	w.loadConfig(*configPath)
+	if *concurrencyOverride > 0 {
+		w.cfg.Concurrency = *concurrencyOverride
+	}
 	w.setupLogging()
 
 	w.rpcStates = make([]*RPCState, len(w.cfg.RPC))
-	for i, rpcURL := range w.cfg.RPC {
-		w.rpcStates[i] = &RPCState{URL: rpcURL}
+	for i, rpcCfg := range w.cfg.RPC {
+		url := buildRPCURL(rpcCfg.URL, rpcCfg.APIKey)
+		w.rpcStates[i] = &RPCState{URL: url}
 	}
 
 	w.promMetrics = WatcherMetrics{
@@ -188,8 +228,17 @@ func main() {
 			Name: "eth_watcher_code_analysis_flags_total",
 			Help: "Total number of times a specific code analysis flag has been detected",
 		}, []string{"flag"}),
+		ChainIDFetchFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eth_watcher_chain_id_fetch_failures_total",
+			Help: "Total number of failed ChainID fetch attempts",
+		}, []string{"url"}),
+		CodeAnalysisDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "eth_watcher_code_analysis_duration_seconds",
+			Help:    "Time taken to analyze contract bytecode in seconds",
+			Buckets: prometheus.DefBuckets,
+		}),
 	}
-	prometheus.MustRegister(w.promMetrics.ContractsDiscovered, w.promMetrics.MintsDetected, w.promMetrics.LiquidityEvents, w.promMetrics.TradesDetected, w.promMetrics.FlashLoansDetected, w.promMetrics.ApprovalsDetected, w.promMetrics.RPCStalled, w.promMetrics.ActiveRPC, w.promMetrics.RPCLatency, w.promMetrics.RPCCircuitBreakerTrips, w.promMetrics.CodeAnalysisFlags)
+	prometheus.MustRegister(w.promMetrics.ContractsDiscovered, w.promMetrics.MintsDetected, w.promMetrics.LiquidityEvents, w.promMetrics.TradesDetected, w.promMetrics.FlashLoansDetected, w.promMetrics.ApprovalsDetected, w.promMetrics.RPCStalled, w.promMetrics.ActiveRPC, w.promMetrics.RPCLatency, w.promMetrics.RPCCircuitBreakerTrips, w.promMetrics.CodeAnalysisFlags, w.promMetrics.ChainIDFetchFailures, w.promMetrics.CodeAnalysisDuration)
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
@@ -234,6 +283,8 @@ func main() {
 		rootCancel()
 	}()
 
+	go w.watchConfig(rootCtx)
+
 	rpcIndex := 0
 	for {
 		if rootCtx.Err() != nil {
@@ -245,32 +296,55 @@ func main() {
 
 		// Attempt to connect, rotating through RPCs and respecting circuit breakers.
 		// We loop through all available RPCs once per connection attempt cycle.
-		for i := 0; i < len(w.rpcStates); i++ {
-			rpcState := w.rpcStates[rpcIndex]
+		w.configLock.RLock()
+		numRPCs := len(w.rpcStates)
+		w.configLock.RUnlock()
+
+		for i := 0; i < numRPCs; i++ {
+			w.configLock.RLock()
+			rpcState := w.rpcStates[rpcIndex%len(w.rpcStates)]
+			w.configLock.RUnlock()
 
 			rpcState.lock.Lock()
 			isTripped := time.Now().Before(rpcState.TrippedUntil)
 			rpcState.lock.Unlock()
 
 			if isTripped {
-				rpcIndex = (rpcIndex + 1) % len(w.rpcStates)
+				rpcIndex++
 				continue // Circuit is open, skip this RPC.
 			}
 
 			url := rpcState.URL
 			client, err = ethclient.Dial(url)
 			if err == nil {
-				log.Printf("Connected to RPC: %s", url)
-				// Reset failure count on successful connection
-				rpcState.lock.Lock()
-				rpcState.FailureCount = 0
-				rpcState.lock.Unlock()
-
-				for _, r := range w.cfg.RPC {
-					w.promMetrics.ActiveRPC.WithLabelValues(r).Set(0)
+				// Attempt to fetch ChainID with retries
+				var cid *big.Int
+				for attempt := 0; attempt < 3; attempt++ {
+					cid, err = client.ChainID(context.Background())
+					if err == nil {
+						break
+					}
+					w.promMetrics.ChainIDFetchFailures.WithLabelValues(url).Inc()
+					time.Sleep(1 * time.Second)
 				}
-				w.promMetrics.ActiveRPC.WithLabelValues(url).Set(1)
-				break
+
+				if err == nil {
+					w.chainID = cid
+					log.Printf("Connected to RPC: %s (ChainID: %s)", url, cid)
+					// Reset failure count on successful connection
+					rpcState.lock.Lock()
+					rpcState.FailureCount = 0
+					rpcState.lock.Unlock()
+
+					w.configLock.RLock()
+					for _, s := range w.rpcStates {
+						w.promMetrics.ActiveRPC.WithLabelValues(s.URL).Set(0)
+					}
+					w.configLock.RUnlock()
+					w.promMetrics.ActiveRPC.WithLabelValues(url).Set(1)
+					break
+				}
+				client.Close()
 			}
 
 			// Connection failed
@@ -284,7 +358,7 @@ func main() {
 			}
 			rpcState.lock.Unlock()
 
-			rpcIndex = (rpcIndex + 1) % len(w.rpcStates)
+			rpcIndex++
 		}
 
 		if client == nil {
@@ -298,6 +372,18 @@ func main() {
 		}
 
 		sessCtx, sessCancel := context.WithCancel(rootCtx)
+		w.configLock.Lock()
+		w.sessCancel = sessCancel
+		outPath := w.cfg.Output
+		w.configLock.Unlock()
+
+		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Printf("Failed to open output file: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
 		var wg sync.WaitGroup
 
 		wg.Add(1)
@@ -306,6 +392,7 @@ func main() {
 		wg.Add(1)
 		go w.subscribeDeployments(sessCtx, client, outFile, &wg, sessCancel)
 
+		w.configLock.RLock()
 		if w.cfg.Events.Transfers {
 			wg.Add(1)
 			go w.subscribeTransfers(sessCtx, client, outFile, &wg, sessCancel)
@@ -322,47 +409,32 @@ func main() {
 			wg.Add(1)
 			go w.subscribeApprovals(sessCtx, client, outFile, &wg, sessCancel)
 		}
+		w.configLock.RUnlock()
 
 		<-sessCtx.Done()
 		client.Close()
+		outFile.Close()
 		wg.Wait()
 		log.Println("Session ended, reconnecting...")
 
 		// Rotate to the next RPC for the next session attempt
-		rpcIndex = (rpcIndex + 1) % len(w.cfg.RPC)
+		rpcIndex++
 	}
 	log.Println("Graceful shutdown complete")
 }
 
 func (w *Watcher) loadConfig(path string) {
-	f, err := os.Open(path)
+	cfg, err := loadConfiguration(path)
 	if err != nil {
-		log.Fatalf("config open error: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
-	defer f.Close()
+	if err := validateConfig(cfg); err != nil {
+		log.Fatalf("Invalid config: %v", err)
+	}
+	w.cfg = *cfg
 
-	if err := json.NewDecoder(f).Decode(&w.cfg); err != nil {
-		log.Fatalf("config decode error: %v", err)
-	}
-
-	if len(w.cfg.RPC) == 0 {
-		log.Fatal("rpc list required in config")
-	}
-	if w.cfg.Output == "" {
-		w.cfg.Output = "eth-watch-events.jsonl"
-	}
-	if w.cfg.Log == "" {
-		w.cfg.Log = "eth-watch.log"
-	}
-
-	if w.cfg.WhaleThreshold != "" {
-		val, ok := new(big.Int).SetString(w.cfg.WhaleThreshold, 10)
-		if ok {
-			w.whaleThreshold = val
-		} else {
-			log.Printf("Warning: Invalid whale_threshold in config: %s", w.cfg.WhaleThreshold)
-		}
-	}
+	val, _ := new(big.Int).SetString(w.cfg.WhaleThreshold, 10)
+	w.whaleThreshold = val
 }
 
 func (w *Watcher) setupLogging() {
@@ -382,6 +454,82 @@ func (w *Watcher) loadWatchedContracts() {
 		}
 	}
 	log.Printf("Loaded %d watched contracts\n", len(w.tracked))
+}
+
+func (w *Watcher) watchConfig(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := os.Stat(w.configPath)
+			if err != nil {
+				continue
+			}
+			if !info.ModTime().Equal(w.lastConfigModTime) {
+				w.lastConfigModTime = info.ModTime()
+				w.reloadConfig()
+			}
+		}
+	}
+}
+
+func (w *Watcher) reloadConfig() {
+	log.Println("Reloading configuration...")
+
+	newCfg, err := loadConfiguration(w.configPath)
+	if err != nil {
+		log.Printf("Failed to load config for reload: %v", err)
+		return
+	}
+	if err := validateConfig(newCfg); err != nil {
+		log.Printf("Config validation failed during reload: %v", err)
+		return
+	}
+
+	newWhaleThreshold, _ := new(big.Int).SetString(newCfg.WhaleThreshold, 10)
+
+	w.configLock.Lock()
+	defer w.configLock.Unlock()
+
+	w.cfg = *newCfg
+	w.whaleThreshold = newWhaleThreshold
+
+	newRPCStates := make([]*RPCState, len(newCfg.RPC))
+	for i, rpcCfg := range newCfg.RPC {
+		url := buildRPCURL(rpcCfg.URL, rpcCfg.APIKey)
+		found := false
+		for _, oldState := range w.rpcStates {
+			if oldState.URL == url {
+				newRPCStates[i] = oldState
+				found = true
+				break
+			}
+		}
+		if !found {
+			newRPCStates[i] = &RPCState{URL: url}
+		}
+	}
+	w.rpcStates = newRPCStates
+
+	w.dexPairs = nil
+	w.dexSwaps = nil
+	for _, d := range w.cfg.Dexes {
+		w.dexPairs = append(w.dexPairs, common.HexToHash(d.PairCreatedTopic))
+		w.dexSwaps = append(w.dexSwaps, common.HexToHash(d.SwapTopic))
+	}
+
+	w.lock.Lock()
+	w.loadWatchedContracts()
+	w.lock.Unlock()
+
+	log.Println("Configuration reloaded successfully. Restarting session...")
+	if w.sessCancel != nil {
+		w.sessCancel()
+	}
 }
 
 func (w *Watcher) startWatchdog(ctx context.Context, client *ethclient.Client, wg *sync.WaitGroup, cancel context.CancelFunc) {
@@ -429,6 +577,11 @@ func (w *Watcher) subscribeDeployments(ctx context.Context, client *ethclient.Cl
 		return
 	}
 
+	// Semaphore to limit concurrent analysis and RPC calls
+	w.configLock.RLock()
+	sem := make(chan struct{}, w.cfg.Concurrency)
+	w.configLock.RUnlock()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -449,63 +602,74 @@ func (w *Watcher) subscribeDeployments(ctx context.Context, client *ethclient.Cl
 				continue
 			}
 
+			var wg sync.WaitGroup
 			for _, tx := range block.Transactions() {
-				if tx.To() != nil {
-					continue
-				}
+				wg.Add(1)
+				go func(tx *types.Transaction) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 
-				receipt, err := client.TransactionReceipt(context.Background(), tx.Hash())
-				if err != nil || receipt.ContractAddress == (common.Address{}) {
-					continue
-				}
+					if tx.To() != nil {
+						return
+					}
 
-				code, err := client.CodeAt(context.Background(), receipt.ContractAddress, nil)
-				if err != nil || len(code) == 0 {
-					continue
-				}
+					receipt, err := client.TransactionReceipt(context.Background(), tx.Hash())
+					if err != nil || receipt.ContractAddress == (common.Address{}) {
+						return
+					}
 
-				tokenType := detectTokenType(code)
-				if tokenType == "" {
-					continue
-				}
+					code, err := client.CodeAt(context.Background(), receipt.ContractAddress, nil)
+					if err != nil || len(code) == 0 {
+						return
+					}
 
-				from, err := types.Sender(types.LatestSignerForChainID(tx.ChainId()), tx)
-				if err != nil {
-					continue
-				}
+					tokenType := detectTokenType(code)
+					if tokenType == "" {
+						return
+					}
 
-				addr := strings.ToLower(receipt.ContractAddress.Hex())
+					from, err := types.Sender(types.LatestSignerForChainID(w.chainID), tx)
+					if err != nil {
+						return
+					}
 
-				w.lock.Lock()
-				w.tracked[addr] = &ContractState{
-					Deployer:  from.Hex(),
-					TokenType: tokenType,
-				}
-				w.stats.NewContracts++
-				w.promMetrics.ContractsDiscovered.Inc()
-				w.lock.Unlock()
+					addr := strings.ToLower(receipt.ContractAddress.Hex())
 
-				log.Printf("New contract %s type=%s deployer=%s", addr, tokenType, from.Hex())
+					w.lock.Lock()
+					w.tracked[addr] = &ContractState{
+						Deployer:  from.Hex(),
+						TokenType: tokenType,
+					}
+					w.stats.NewContracts++
+					w.promMetrics.ContractsDiscovered.Inc()
+					w.lock.Unlock()
 
-				analysisFlags, analysisScore := analyzeCode(code)
-				for _, flag := range analysisFlags {
-					w.promMetrics.CodeAnalysisFlags.WithLabelValues(flag).Inc()
-				}
-				flags := []string{"NewContract"}
-				flags = append(flags, analysisFlags...)
+					log.Printf("New contract %s type=%s deployer=%s", addr, tokenType, from.Hex())
 
-				writeEvent(out, Finding{
-					Contract:  addr,
-					Deployer:  from.Hex(),
-					Block:     receipt.BlockNumber.Uint64(),
-					TokenType: tokenType,
-					RiskScore: 10 + analysisScore,
-					Flags:     flags,
-					TxHash:    tx.Hash().Hex(),
-				})
+					analysisStart := time.Now()
+					analysisFlags, analysisScore := analyzeCode(code)
+					w.promMetrics.CodeAnalysisDuration.Observe(time.Since(analysisStart).Seconds())
+					for _, flag := range analysisFlags {
+						w.promMetrics.CodeAnalysisFlags.WithLabelValues(flag).Inc()
+					}
+					flags := []string{"NewContract"}
+					flags = append(flags, analysisFlags...)
 
-				w.writeStats()
+					w.writeEvent(out, Finding{
+						Contract:  addr,
+						Deployer:  from.Hex(),
+						Block:     receipt.BlockNumber.Uint64(),
+						TokenType: tokenType,
+						RiskScore: 10 + analysisScore,
+						Flags:     flags,
+						TxHash:    tx.Hash().Hex(),
+					})
+
+					w.writeStats()
+				}(tx)
 			}
+			wg.Wait()
 		}
 	}
 }
@@ -668,9 +832,12 @@ func (w *Watcher) handleTransfer(vLog types.Log, out *os.File) {
 		flags = append(flags, "MultipleMints")
 	}
 
-	if w.whaleThreshold != nil && strings.EqualFold(state.TokenType, "ERC20") && len(vLog.Data) > 0 {
+	w.configLock.RLock()
+	whaleThreshold := w.whaleThreshold
+	w.configLock.RUnlock()
+	if whaleThreshold != nil && strings.EqualFold(state.TokenType, "ERC20") && len(vLog.Data) > 0 {
 		val := new(big.Int).SetBytes(vLog.Data)
-		if val.Cmp(w.whaleThreshold) >= 0 {
+		if val.Cmp(whaleThreshold) >= 0 {
 			flags = append(flags, "WhaleTransfer")
 			score += 25
 		}
@@ -680,7 +847,7 @@ func (w *Watcher) handleTransfer(vLog types.Log, out *os.File) {
 		score = 100
 	}
 
-	writeEvent(out, Finding{
+	w.writeEvent(out, Finding{
 		Contract:     contract,
 		Deployer:     state.Deployer,
 		Block:        uint64(vLog.BlockNumber),
@@ -742,7 +909,7 @@ func (w *Watcher) handleLiquidityEvent(vLog types.Log, out *os.File) {
 
 	for _, f := range findings {
 		log.Printf("Liquidity detected for %s", f.Contract)
-		writeEvent(out, f)
+		w.writeEvent(out, f)
 		w.writeStats()
 	}
 }
@@ -773,7 +940,7 @@ func (w *Watcher) handleTradeEvent(vLog types.Log, out *os.File) {
 	w.lock.Unlock()
 
 	log.Printf("Trade detected for %s", addr)
-	writeEvent(out, f)
+	w.writeEvent(out, f)
 	w.writeStats()
 }
 
@@ -804,7 +971,7 @@ func (w *Watcher) handleFlashLoan(vLog types.Log, out *os.File) {
 		flags = append(flags, "Asset:"+asset)
 	}
 
-	writeEvent(out, Finding{
+	w.writeEvent(out, Finding{
 		Contract:  addr,
 		Deployer:  state.Deployer,
 		Block:     uint64(vLog.BlockNumber),
@@ -846,13 +1013,18 @@ func (w *Watcher) handleApproval(vLog types.Log, out *os.File) {
 		if val.Cmp(maxUint256) == 0 {
 			flags = append(flags, "InfiniteApproval")
 			score += 40
-		} else if w.whaleThreshold != nil && val.Cmp(w.whaleThreshold) >= 0 {
-			flags = append(flags, "LargeApproval")
-			score += 20
+		} else {
+			w.configLock.RLock()
+			whaleThreshold := w.whaleThreshold
+			w.configLock.RUnlock()
+			if whaleThreshold != nil && val.Cmp(whaleThreshold) >= 0 {
+				flags = append(flags, "LargeApproval")
+				score += 20
+			}
 		}
 	}
 
-	writeEvent(out, Finding{
+	w.writeEvent(out, Finding{
 		Contract:  contract,
 		Deployer:  state.Deployer,
 		Block:     uint64(vLog.BlockNumber),
@@ -865,13 +1037,12 @@ func (w *Watcher) handleApproval(vLog types.Log, out *os.File) {
 }
 
 func detectTokenType(code []byte) string {
-	s := strings.ToLower(common.Bytes2Hex(code))
 	switch {
-	case strings.Contains(s, "a9059cbb"):
+	case bytes.Contains(code, []byte{0xa9, 0x05, 0x9c, 0xbb}):
 		return "ERC20"
-	case strings.Contains(s, "80ac58cd"):
+	case bytes.Contains(code, []byte{0x80, 0xac, 0x58, 0xcd}):
 		return "ERC721"
-	case strings.Contains(s, "d9b67a26"):
+	case bytes.Contains(code, []byte{0xd9, 0xb6, 0x7a, 0x26}):
 		return "ERC1155"
 	default:
 		return ""
@@ -881,55 +1052,54 @@ func detectTokenType(code []byte) string {
 func analyzeCode(code []byte) ([]string, int) {
 	var flags []string
 	score := 0
-	hexCode := common.Bytes2Hex(code)
 
 	// Check for common function selectors (signatures)
 	// mint(address,uint256): 40c10f19
-	if strings.Contains(hexCode, "40c10f19") {
+	if bytes.Contains(code, []byte{0x40, 0xc1, 0x0f, 0x19}) {
 		flags = append(flags, "Mintable")
 		score += 10
 	}
 	// burn(uint256): 42966c68
-	if strings.Contains(hexCode, "42966c68") {
+	if bytes.Contains(code, []byte{0x42, 0x96, 0x6c, 0x68}) {
 		flags = append(flags, "Burnable")
 	}
 	// transferOwnership(address): f2fde38b
-	if strings.Contains(hexCode, "f2fde38b") {
+	if bytes.Contains(code, []byte{0xf2, 0xfd, 0xe3, 0x8b}) {
 		flags = append(flags, "Ownable")
 	}
 	// blacklist(address): 1d3b9edf, isBlacklisted(address): fe575a87
-	if strings.Contains(hexCode, "1d3b9edf") || strings.Contains(hexCode, "fe575a87") {
+	if bytes.Contains(code, []byte{0x1d, 0x3b, 0x9e, 0xdf}) || bytes.Contains(code, []byte{0xfe, 0x57, 0x5a, 0x87}) {
 		flags = append(flags, "Blacklist")
 		score += 20
 	}
 	// upgradeTo(address): 3659cfe6
-	if strings.Contains(hexCode, "3659cfe6") {
+	if bytes.Contains(code, []byte{0x36, 0x59, 0xcf, 0xe6}) {
 		flags = append(flags, "Upgradable")
 		score += 5
 	}
 	// supportsInterface(bytes4): 01ffc9a7
-	if strings.Contains(hexCode, "01ffc9a7") {
+	if bytes.Contains(code, []byte{0x01, 0xff, 0xc9, 0xa7}) {
 		flags = append(flags, "InterfaceCheck")
 	}
 	// constructor(): 673448dd (Incorrect naming in modern Solidity)
-	if strings.Contains(hexCode, "673448dd") {
+	if bytes.Contains(code, []byte{0x67, 0x34, 0x48, 0xdd}) {
 		flags = append(flags, "IncorrectConstructor")
 		score += 5
 	}
 	// withdraw(): 3ccfd60b, withdraw(uint256): 2e1a7d4d
-	if strings.Contains(hexCode, "3ccfd60b") || strings.Contains(hexCode, "2e1a7d4d") {
+	if bytes.Contains(code, []byte{0x3c, 0xcf, 0xd6, 0x0b}) || bytes.Contains(code, []byte{0x2e, 0x1a, 0x7d, 0x4d}) {
 		flags = append(flags, "Withdrawal")
 	}
 	// renounceOwnership(): 715018a6
-	if strings.Contains(hexCode, "715018a6") {
+	if bytes.Contains(code, []byte{0x71, 0x50, 0x18, 0xa6}) {
 		flags = append(flags, "RenounceOwnership")
 	}
 	// flashLoan(...): 5cffe9de (Aave/Standard)
-	if strings.Contains(hexCode, "5cffe9de") {
+	if bytes.Contains(code, []byte{0x5c, 0xff, 0xe9, 0xde}) {
 		flags = append(flags, "FlashLoan")
 	}
 	// transfer(address,uint256): a9059cbb (Used for FakeToken detection)
-	hasTransferSig := strings.Contains(hexCode, "a9059cbb")
+	hasTransferSig := bytes.Contains(code, []byte{0xa9, 0x05, 0x9c, 0xbb})
 
 	// Opcode scanning
 	hasSelfDestruct := false
@@ -978,8 +1148,8 @@ func analyzeCode(code []byte) ([]string, int) {
 
 	hasAddSubMul := false
 	hasCalldataLoad := false
-	hasPanic := strings.Contains(hexCode, "4e487b71")
-	hasReentrancyGuard := strings.Contains(hexCode, "5265656e7472616e63794775617264") // "ReentrancyGuard"
+	hasPanic := bytes.Contains(code, []byte{0x4e, 0x48, 0x7b, 0x71})
+	hasReentrancyGuard := bytes.Contains(code, []byte("ReentrancyGuard")) // "ReentrancyGuard"
 
 	// Counters for loop analysis
 	countCalls := 0
@@ -992,10 +1162,10 @@ func analyzeCode(code []byte) ([]string, int) {
 	jumpDests := make(map[int]struct{ c, dc, cr, sd, g, ss int })
 
 	// Transfer Event Topic: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
-	hasTransferEvent := strings.Contains(hexCode, "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+	hasTransferEvent := bytes.Contains(code, common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").Bytes())
 
 	// ERC1820 Registry Address (ERC777): 0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24
-	hasERC1820 := strings.Contains(hexCode, "1820a4b7618bde71dce8cdc73aab6c95905fad24")
+	hasERC1820 := bytes.Contains(code, common.HexToAddress("0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24").Bytes())
 
 	pc := 0
 	lastOp := byte(0)
@@ -1372,6 +1542,66 @@ func analyzeCode(code []byte) ([]string, int) {
 	return flags, score
 }
 
+func loadConfiguration(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("config open error: %v", err)
+	}
+	defer f.Close()
+
+	var cfg Config
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("config decode error: %v", err)
+	}
+
+	if cfg.Output == "" {
+		cfg.Output = "eth-watch-events.jsonl"
+	}
+	if cfg.Log == "" {
+		cfg.Log = "eth-watch.log"
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 20
+	}
+
+	return &cfg, nil
+}
+
+func validateConfig(cfg *Config) error {
+	if len(cfg.RPC) == 0 {
+		return fmt.Errorf("rpc list required in config")
+	}
+
+	hasValidRPC := false
+	for _, r := range cfg.RPC {
+		if r.URL != "" {
+			hasValidRPC = true
+			break
+		}
+	}
+	if !hasValidRPC {
+		return fmt.Errorf("at least one valid RPC URL is required")
+	}
+
+	if cfg.WhaleThreshold != "" {
+		_, ok := new(big.Int).SetString(cfg.WhaleThreshold, 10)
+		if !ok {
+			return fmt.Errorf("invalid whale_threshold: %s", cfg.WhaleThreshold)
+		}
+	}
+	return nil
+}
+
+func buildRPCURL(base, key string) string {
+	if key == "" {
+		return base
+	}
+	if strings.HasPrefix(key, "?") || strings.HasSuffix(base, "/") {
+		return base + key
+	}
+	return base + "/" + key
+}
+
 func bytesToInt(b []byte) int {
 	res := 0
 	for _, v := range b {
@@ -1389,16 +1619,18 @@ func containsHash(list []common.Hash, h common.Hash) bool {
 	return false
 }
 
-func writeEvent(out *os.File, f Finding) {
-	w := bufio.NewWriter(out)
+func (w *Watcher) writeEvent(out *os.File, f Finding) {
+	w.fileLock.Lock()
+	defer w.fileLock.Unlock()
+	writer := bufio.NewWriter(out)
 	b, err := json.Marshal(f)
 	if err != nil {
 		log.Printf("json marshal error: %v", err)
 		return
 	}
-	_, _ = w.Write(b)
-	_, _ = w.Write([]byte("\n"))
-	_ = w.Flush()
+	_, _ = writer.Write(b)
+	_, _ = writer.Write([]byte("\n"))
+	_ = writer.Flush()
 }
 
 func (w *Watcher) writeStats() {

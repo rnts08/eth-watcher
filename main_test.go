@@ -288,3 +288,99 @@ func TestAnalyzeCode(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildRPCURL(t *testing.T) {
+	tests := []struct {
+		name string
+		base string
+		key  string
+		want string
+	}{
+		{
+			name: "NoKey",
+			base: "https://rpc.example.com",
+			key:  "",
+			want: "https://rpc.example.com",
+		},
+		{
+			name: "SimpleAppend",
+			base: "https://rpc.example.com",
+			key:  "12345",
+			want: "https://rpc.example.com/12345",
+		},
+		{
+			name: "BaseWithSlash",
+			base: "https://rpc.example.com/",
+			key:  "12345",
+			want: "https://rpc.example.com/12345",
+		},
+		{
+			name: "QueryParamKey",
+			base: "https://rpc.example.com",
+			key:  "?key=12345",
+			want: "https://rpc.example.com?key=12345",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildRPCURL(tt.base, tt.key); got != tt.want {
+				t.Errorf("buildRPCURL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr bool
+	}{
+		{
+			name: "ValidConfig",
+			cfg: Config{
+				RPC: []RPCConfig{{URL: "wss://example.com"}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "NoRPCs",
+			cfg: Config{
+				RPC: []RPCConfig{},
+			},
+			wantErr: true,
+		},
+		{
+			name: "EmptyRPCURL",
+			cfg: Config{
+				RPC: []RPCConfig{{URL: ""}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "ValidWhaleThreshold",
+			cfg: Config{
+				RPC:            []RPCConfig{{URL: "wss://example.com"}},
+				WhaleThreshold: "1000000000000000000",
+			},
+			wantErr: false,
+		},
+		{
+			name: "InvalidWhaleThreshold",
+			cfg: Config{
+				RPC:            []RPCConfig{{URL: "wss://example.com"}},
+				WhaleThreshold: "not-a-number",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateConfig(&tt.cfg); (err != nil) != tt.wantErr {
+				t.Errorf("validateConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -1,6 +1,10 @@
 {
-  "rpc": ["wss://ethereum-rpc.publicnode.com","wss://mainnet.gateway.tenderly.co","wss://0xrpc.io/eth", "https://rpc.mevblocker.io"],
-  "apiKey": "",
+  "rpc": [
+    {"url": "wss://ethereum-rpc.publicnode.com", "apiKey": ""},
+    {"url": "wss://mainnet.gateway.tenderly.co", "apiKey": ""},
+    {"url": "wss://0xrpc.io/eth", "apiKey": ""},
+    {"url": "https://rpc.mevblocker.io", "apiKey": ""}
+  ],
   "log": "eth-watchtower.log",
   "out": "eth-watchtower.jsonl",
   "events": {
